@@ -15,9 +15,7 @@
 - 📦 **免环境安装**：利用 Python 纯自带的系统库 `tkinter`, `urllib`, `winsound` 等。只要你能跑得起 GPT-SoVITS 默认的整合包（自带的 `runtime/python` 环境），这套工具双击就能跑，**完全 0 依赖**。
 
 ## 📸 界面预览 (Screenshots)
-> *(大家可以将运行成功后的悬浮窗样式截图、以及展开后的设置面板截图放到此处)*  
-![悬浮窗预览 (占位)](#)  
-![设置面板预览 (占位)](#)
+![游戏内悬浮窗实机演示](assets/preview.png)
 
 ## 🚀 安装与启动 (Installation & Usage)
 
