@@ -19,20 +19,25 @@
 
 ## 🚀 安装与启动 (Installation & Usage)
 
-因为本作依赖原生 GPT-SoVITS 的环境提供推理服务，所以推荐将下载后的 `floating_tts.py` 放在你的 `GPT-SoVITS` 根目录（包含 `api_v2.py` 的那个文件夹内）。
+因为本作依赖原生 GPT-SoVITS 的环境提供推理服务，所以请直接将 `floating_tts.py` 和 `go-floating-tts.bat` 放在你的 `GPT-SoVITS` 根目录（包含 `api_v2.py` 的那个文件夹内）。
 
-### 第一步：启动核心 API
-必须首先启动 GPT-SoVITS 后端原生 API（需用到 v2 的流式无损传输能力）。在你的根目录打开终端运行：
-```bat
-runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880
-```
-*提示：切记要用 `runtime\python.exe` 运行，否则可能提示缺少依赖库 `soundfile`。*
+### 快捷启动 (推荐)
+直接双击运行主目录下的：
+**`go-floating-tts.bat`**
+它会自动在后台打开 API 服务，并随后呼出悬浮窗。
 
-### 第二步：启动悬浮窗
-无需等待第一步窗口中的模型加载完，你可以直接在另一个新终端窗口（仍是同个根目录）运行：
-```bat
-runtime\python.exe floating_tts.py
-```
+---
+
+### 手动分步启动 (进阶)
+如果你想分别调试：
+1. **启动核心 API**：
+   ```bat
+   runtime\python.exe api_v2.py -a 127.0.0.1 -p 9880
+   ```
+2. **启动悬浮窗**：
+   ```bat
+   runtime\python.exe floating_tts.py
+   ```
 
 ### 第三步：配置与使用
 首次打开后，请：
