@@ -21,7 +21,8 @@ DEFAULT_CONFIG = {
     "speed_factor": 1.0,
     "opacity": 0.85,
     "gpt_model": "",
-    "sovits_model": ""
+    "sovits_model": "",
+    "run_mode": "Local" # Or "Cloud"
 }
 
 class FloatingTTSApp:
@@ -198,7 +199,7 @@ class FloatingTTSApp:
     def open_settings(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("TTS Settings")
-        dlg.geometry("500x420")
+        dlg.geometry("500x520")
         dlg.configure(bg=self.bg_color)
         dlg.attributes("-topmost", True)
         dlg.transient(self.root)
@@ -273,48 +274,107 @@ class FloatingTTSApp:
 
         gpt_models, sovits_models = get_model_lists()
 
-        # Row builder for combobox
-        def create_combo_row(parent, label_text, var_name, values):
+        # Row builder for mode selection
+        def create_mode_row(parent):
             row = tk.Frame(parent, bg=self.bg_color)
             row.pack(fill=tk.X, pady=5)
-            tk.Label(row, text=label_text, bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
+            tk.Label(row, text="Run Mode:", bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
             
-            var = tk.StringVar(value=str(self.config.get(var_name, "")))
-            combo = ttk.Combobox(row, textvariable=var, values=values, font=("Segoe UI", 10), state="readonly")
-            combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            return var
+            mode_var = tk.StringVar(value=self.config.get("run_mode", "Local"))
+            mode_combo = ttk.Combobox(row, textvariable=mode_var, values=["Local", "Cloud"], font=("Segoe UI", 10), state="readonly")
+            mode_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            def handle_mode_change(e):
+                self.config["run_mode"] = mode_var.get()
+                # Re-render or update UI visibility if needed
+                update_ui_state()
+            
+            mode_combo.bind("<<ComboboxSelected>>", handle_mode_change)
+            return mode_var
 
-        # Row builder
-        def create_row(parent, label_text, var_name, is_file=False):
+        # Row builder for combobox or entry based on mode
+        def create_dynamic_row(parent, label_text, var_name, values, is_file=False):
             row = tk.Frame(parent, bg=self.bg_color)
             row.pack(fill=tk.X, pady=5)
             tk.Label(row, text=label_text, bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
             
             var = tk.StringVar(value=str(self.config.get(var_name, "")))
-            entry = tk.Entry(row, textvariable=var, font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat")
-            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
             
-            if is_file:
+            # Use two widgets: one for Local (Combo/Browse) and one for Cloud (Entry)
+            local_frame = tk.Frame(row, bg=self.bg_color)
+            cloud_frame = tk.Frame(row, bg=self.bg_color)
+            
+            # Local widgets
+            if values: # Model selection
+                combo = ttk.Combobox(local_frame, textvariable=var, values=values, font=("Segoe UI", 10), state="readonly")
+                combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            else: # Path entry with browse
+                entry = tk.Entry(local_frame, textvariable=var, font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat")
+                entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
                 def browse():
                     p = filedialog.askopenfilename(title="Select Audio File", filetypes=(("WAV files", "*.wav"), ("All files", "*.*")))
-                    if p:
-                        var.set(p)
-                tk.Button(row, text="...", command=browse, bg="#555555", fg="white", relief="flat").pack(side=tk.LEFT, padx=(5, 0))
-            return var
+                    if p: var.set(p)
+                tk.Button(local_frame, text="...", command=browse, bg="#555555", fg="white", relief="flat").pack(side=tk.LEFT, padx=(5, 0))
+                
+            # Cloud widget (always manual entry)
+            cloud_entry = tk.Entry(cloud_frame, textvariable=var, font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat")
+            cloud_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+            
+            def update_visibility():
+                if self.config.get("run_mode") == "Local":
+                    cloud_frame.pack_forget()
+                    local_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                else:
+                    local_frame.pack_forget()
+                    cloud_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                    
+            return var, update_visibility
 
         self._vars = {}
-        self._vars["api_url"] = create_row(frame, "API URL:", "api_url")
-        self._vars["gpt_model"] = create_combo_row(frame, "GPT Model:", "gpt_model", gpt_models)
-        self._vars["sovits_model"] = create_combo_row(frame, "SoVITS Model:", "sovits_model", sovits_models)
-        self._vars["ref_audio_path"] = create_row(frame, "Ref Audio Path:", "ref_audio_path", is_file=True)
-        self._vars["prompt_text"] = create_row(frame, "Prompt Text:", "prompt_text")
-        self._vars["prompt_lang"] = create_row(frame, "Prompt Lang:", "prompt_lang")
-        self._vars["text_lang"] = create_row(frame, "Target Lang:", "text_lang")
-        self._vars["opacity"] = create_row(frame, "Window Opacity (0-1):", "opacity")
-        self._vars["speed_factor"] = create_row(frame, "Speed (1.0):", "speed_factor")
-        self._vars["text_split_method"] = create_row(frame, "Split Method:", "text_split_method")
+        self._update_funcs = []
+        
+        mode_var = create_mode_row(frame)
+        self._vars["run_mode"] = mode_var
+        
+        api_row = tk.Frame(frame, bg=self.bg_color)
+        api_row.pack(fill=tk.X, pady=5)
+        tk.Label(api_row, text="API URL:", bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
+        self._vars["api_url"] = tk.StringVar(value=self.config.get("api_url", "http://127.0.0.1:9880/tts"))
+        tk.Entry(api_row, textvariable=self._vars["api_url"], font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat").pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
 
-        info_lbl = tk.Label(frame, text="Lang Codes: zh (Chinese), en (English), ja (Japanese), auto", bg=self.bg_color, fg="#aaaaaa", font=("Segoe UI", 8))
+        v_gpt, u_gpt = create_dynamic_row(frame, "GPT Model:", "gpt_model", gpt_models)
+        self._vars["gpt_model"] = v_gpt
+        self._update_funcs.append(u_gpt)
+        
+        v_sov, u_sov = create_dynamic_row(frame, "SoVITS Model:", "sovits_model", sovits_models)
+        self._vars["sovits_model"] = v_sov
+        self._update_funcs.append(u_sov)
+        
+        v_ref, u_ref = create_dynamic_row(frame, "Ref Audio Path:", "ref_audio_path", None, is_file=True)
+        self._vars["ref_audio_path"] = v_ref
+        self._update_funcs.append(u_ref)
+
+        def create_standard_row(parent, label_text, var_name):
+            row = tk.Frame(parent, bg=self.bg_color)
+            row.pack(fill=tk.X, pady=5)
+            tk.Label(row, text=label_text, bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
+            var = tk.StringVar(value=str(self.config.get(var_name, "")))
+            tk.Entry(row, textvariable=var, font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat").pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+            return var
+
+        self._vars["prompt_text"] = create_standard_row(frame, "Prompt Text:", "prompt_text")
+        self._vars["prompt_lang"] = create_standard_row(frame, "Prompt Lang:", "prompt_lang")
+        self._vars["text_lang"] = create_standard_row(frame, "Target Lang:", "text_lang")
+        self._vars["opacity"] = create_standard_row(frame, "Window Opacity:", "opacity")
+        self._vars["speed_factor"] = create_standard_row(frame, "Speed:", "speed_factor")
+        self._vars["text_split_method"] = create_standard_row(frame, "Split Method:", "text_split_method")
+
+        def update_ui_state():
+            for f in self._update_funcs: f()
+        
+        update_ui_state()
+
+        info_lbl = tk.Label(frame, text="Lang Codes: zh (Chinese), en (English), ja (Japanese), auto\nCloud Mode: Enter remote paths manually.", bg=self.bg_color, fg="#aaaaaa", font=("Segoe UI", 8), justify=tk.LEFT)
         info_lbl.pack(pady=5)
 
         btn_font = ("Segoe UI", 10)
@@ -357,3 +417,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = FloatingTTSApp(root)
     root.mainloop()
+
