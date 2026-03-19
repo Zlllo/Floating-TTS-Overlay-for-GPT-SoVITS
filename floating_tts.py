@@ -3,8 +3,12 @@ from tkinter import ttk, messagebox, filedialog
 import threading
 import json
 import os
+import shlex
+import subprocess
+import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import io
 import winsound
 
@@ -22,18 +26,30 @@ DEFAULT_CONFIG = {
     "opacity": 0.85,
     "gpt_model": "",
     "sovits_model": "",
-    "run_mode": "Local" # Or "Cloud"
+    "run_mode": "Local", # Or "Cloud"
+    "use_ssh_tunnel": True,
+    "ssh_host": "",
+    "ssh_port": 22,
+    "ssh_user": "",
+    "ssh_key_path": "",
+    "ssh_local_port": 9880,
+    "ssh_remote_host": "127.0.0.1",
+    "ssh_remote_port": 9880,
+    "ssh_extra_args": ""
 }
 
 class FloatingTTSApp:
     def __init__(self, root):
         self.root = root
         self.config = self.load_config()
+        self.ssh_process = None
+        self.ssh_lock = threading.Lock()
         
         # --- Root Window Setup ---
         self.root.overrideredirect(True)  # No borders
         self.root.attributes("-topmost", True)  # Always on top
         self.root.attributes("-alpha", self.config.get("opacity", 0.85))  # Transparency
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
         
         # Set background color to look sleek
         self.bg_color = "#2b2b2b"
@@ -56,6 +72,10 @@ class FloatingTTSApp:
         y = screen_height - window_height - 100
         self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
         self.root.minsize(300, 60)
+
+    def close_app(self):
+        self.stop_ssh_tunnel()
+        self.root.destroy()
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -113,8 +133,94 @@ class FloatingTTSApp:
         self.settings_btn.pack(side=tk.LEFT, padx=(5, 0))
 
         # Close button
-        self.close_btn = tk.Button(self.main_frame, text="×", command=self.root.destroy, bg=self.bg_color, fg="white", font=("Segoe UI", 10), relief="flat", activebackground="red", bd=0)
+        self.close_btn = tk.Button(self.main_frame, text="×", command=self.close_app, bg=self.bg_color, fg="white", font=("Segoe UI", 10), relief="flat", activebackground="red", bd=0)
         self.close_btn.place(relx=1.0, rely=0.0, anchor="ne", x=0, y=0, width=24, height=24)
+
+    def _to_int(self, value, default):
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return default
+
+    def use_ssh_tunnel(self):
+        return self.config.get("run_mode") == "Cloud" and bool(self.config.get("use_ssh_tunnel", True))
+
+    def get_effective_api_url(self):
+        if self.use_ssh_tunnel():
+            local_port = self._to_int(self.config.get("ssh_local_port", 9880), 9880)
+            return f"http://127.0.0.1:{local_port}/tts"
+        return self.config.get("api_url", "http://127.0.0.1:9880/tts")
+
+    def get_ssh_command(self):
+        ssh_host = self.config.get("ssh_host", "").strip()
+        ssh_user = self.config.get("ssh_user", "").strip()
+        if not ssh_host or not ssh_user:
+            raise ValueError("Cloud mode requires SSH Host and SSH User when SSH tunneling is enabled.")
+
+        local_port = self._to_int(self.config.get("ssh_local_port", 9880), 9880)
+        remote_port = self._to_int(self.config.get("ssh_remote_port", 9880), 9880)
+        ssh_port = self._to_int(self.config.get("ssh_port", 22), 22)
+        remote_host = self.config.get("ssh_remote_host", "127.0.0.1").strip() or "127.0.0.1"
+        key_path = self.config.get("ssh_key_path", "").strip()
+        extra_args = self.config.get("ssh_extra_args", "").strip()
+
+        cmd = [
+            "ssh",
+            "-N",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            "-p", str(ssh_port),
+            "-L", f"{local_port}:{remote_host}:{remote_port}"
+        ]
+        if key_path:
+            cmd.extend(["-i", key_path])
+        if extra_args:
+            cmd.extend(shlex.split(extra_args, posix=False))
+        cmd.append(f"{ssh_user}@{ssh_host}")
+        return cmd
+
+    def ensure_ssh_tunnel(self):
+        if not self.use_ssh_tunnel():
+            return
+
+        with self.ssh_lock:
+            if self.ssh_process and self.ssh_process.poll() is None:
+                return
+
+            cmd = self.get_ssh_command()
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+            self.root.after(0, self.set_status, "Connecting SSH...", "#ffaa00")
+            self.ssh_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                startupinfo=startupinfo,
+                creationflags=creationflags
+            )
+            time.sleep(0.8)
+            if self.ssh_process.poll() is not None:
+                err = self.ssh_process.stderr.read().decode("utf-8", errors="ignore").strip()
+                self.ssh_process = None
+                raise RuntimeError(err or "SSH tunnel failed to start.")
+
+    def stop_ssh_tunnel(self):
+        with self.ssh_lock:
+            if not self.ssh_process:
+                return
+            if self.ssh_process.poll() is None:
+                self.ssh_process.terminate()
+                try:
+                    self.ssh_process.wait(timeout=2)
+                except Exception:
+                    self.ssh_process.kill()
+            self.ssh_process = None
 
     def clickwin(self, event):
         self._offsetx = event.x
@@ -147,6 +253,7 @@ class FloatingTTSApp:
 
     def run_tts(self, text):
         try:
+            self.ensure_ssh_tunnel()
             req_data = {
                 "text": text,
                 "text_lang": self.config["text_lang"],
@@ -161,7 +268,7 @@ class FloatingTTSApp:
             }
 
             data = json.dumps(req_data).encode("utf-8")
-            api_url = self.config.get("api_url", "http://127.0.0.1:9880/tts")
+            api_url = self.get_effective_api_url()
             
             req = urllib.request.Request(api_url, data=data, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req) as response:
@@ -292,6 +399,24 @@ class FloatingTTSApp:
             mode_combo.bind("<<ComboboxSelected>>", handle_mode_change)
             return mode_var
 
+        def create_check_row(parent, label_text, var_name):
+            row = tk.Frame(parent, bg=self.bg_color)
+            row.pack(fill=tk.X, pady=5)
+            tk.Label(row, text=label_text, bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
+            var = tk.BooleanVar(value=bool(self.config.get(var_name, False)))
+            chk = tk.Checkbutton(
+                row,
+                variable=var,
+                bg=self.bg_color,
+                fg=self.fg_color,
+                activebackground=self.bg_color,
+                selectcolor="#3b3b3b",
+                highlightthickness=0,
+                command=lambda: update_ui_state()
+            )
+            chk.pack(side=tk.LEFT, anchor="w")
+            return row, var
+
         # Row builder for combobox or entry based on mode
         def create_dynamic_row(parent, label_text, var_name, values, is_file=False):
             row = tk.Frame(parent, bg=self.bg_color)
@@ -330,6 +455,44 @@ class FloatingTTSApp:
                     
             return var, update_visibility
 
+        def create_standard_row(parent, label_text, var_name, show_in_cloud=True, show_in_local=True, is_file=False, browse_title="Select File"):
+            row = tk.Frame(parent, bg=self.bg_color)
+            row.pack(fill=tk.X, pady=5)
+            tk.Label(row, text=label_text, bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
+            var = tk.StringVar(value=str(self.config.get(var_name, "")))
+            entry = tk.Entry(row, textvariable=var, font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat")
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+            if is_file:
+                def browse():
+                    path = filedialog.askopenfilename(title=browse_title, filetypes=(("All files", "*.*"),))
+                    if path:
+                        var.set(path)
+                tk.Button(row, text="...", command=browse, bg="#555555", fg="white", relief="flat").pack(side=tk.LEFT, padx=(5, 0))
+
+            def update_visibility():
+                mode = self._vars["run_mode"].get() if "run_mode" in self._vars else self.config.get("run_mode", "Local")
+                should_show = (mode == "Cloud" and show_in_cloud) or (mode == "Local" and show_in_local)
+                if should_show and not row.winfo_manager():
+                    row.pack(fill=tk.X, pady=5)
+                elif not should_show and row.winfo_manager():
+                    row.pack_forget()
+
+            return row, var, update_visibility
+
+        def create_ssh_row(parent, label_text, var_name, is_file=False):
+            row, var, _ = create_standard_row(parent, label_text, var_name, show_in_cloud=True, show_in_local=False, is_file=is_file, browse_title="Select SSH Key")
+
+            def update_visibility():
+                mode = self._vars["run_mode"].get() if "run_mode" in self._vars else self.config.get("run_mode", "Local")
+                use_tunnel = self._vars["use_ssh_tunnel"].get() if "use_ssh_tunnel" in self._vars else bool(self.config.get("use_ssh_tunnel", True))
+                should_show = mode == "Cloud" and use_tunnel
+                if should_show and not row.winfo_manager():
+                    row.pack(fill=tk.X, pady=5)
+                elif not should_show and row.winfo_manager():
+                    row.pack_forget()
+
+            return row, var, update_visibility
+
         self._vars = {}
         self._update_funcs = []
         
@@ -341,6 +504,25 @@ class FloatingTTSApp:
         tk.Label(api_row, text="API URL:", bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
         self._vars["api_url"] = tk.StringVar(value=self.config.get("api_url", "http://127.0.0.1:9880/tts"))
         tk.Entry(api_row, textvariable=self._vars["api_url"], font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat").pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
+        def update_api_row():
+            mode = self._vars["run_mode"].get()
+            use_tunnel = self._vars["use_ssh_tunnel"].get() if "use_ssh_tunnel" in self._vars else bool(self.config.get("use_ssh_tunnel", True))
+            should_show = mode == "Local" or (mode == "Cloud" and not use_tunnel)
+            if should_show and not api_row.winfo_manager():
+                api_row.pack(fill=tk.X, pady=5)
+            elif not should_show and api_row.winfo_manager():
+                api_row.pack_forget()
+        self._update_funcs.append(update_api_row)
+
+        ssh_toggle_row, ssh_toggle_var = create_check_row(frame, "Use SSH Tunnel:", "use_ssh_tunnel")
+        self._vars["use_ssh_tunnel"] = ssh_toggle_var
+        def update_ssh_toggle():
+            mode = self._vars["run_mode"].get()
+            if mode == "Cloud" and not ssh_toggle_row.winfo_manager():
+                ssh_toggle_row.pack(fill=tk.X, pady=5)
+            elif mode != "Cloud" and ssh_toggle_row.winfo_manager():
+                ssh_toggle_row.pack_forget()
+        self._update_funcs.append(update_ssh_toggle)
 
         v_gpt, u_gpt = create_dynamic_row(frame, "GPT Model:", "gpt_model", gpt_models)
         self._vars["gpt_model"] = v_gpt
@@ -354,27 +536,42 @@ class FloatingTTSApp:
         self._vars["ref_audio_path"] = v_ref
         self._update_funcs.append(u_ref)
 
-        def create_standard_row(parent, label_text, var_name):
-            row = tk.Frame(parent, bg=self.bg_color)
-            row.pack(fill=tk.X, pady=5)
-            tk.Label(row, text=label_text, bg=self.bg_color, fg=self.fg_color, width=15, anchor="e").pack(side=tk.LEFT, padx=(0, 10))
-            var = tk.StringVar(value=str(self.config.get(var_name, "")))
-            tk.Entry(row, textvariable=var, font=("Segoe UI", 10), bg="#3b3b3b", fg=self.fg_color, insertbackground=self.fg_color, relief="flat").pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=3)
-            return var
+        _, self._vars["prompt_text"], u_prompt = create_standard_row(frame, "Prompt Text:", "prompt_text")
+        self._update_funcs.append(u_prompt)
+        _, self._vars["prompt_lang"], u_prompt_lang = create_standard_row(frame, "Prompt Lang:", "prompt_lang")
+        self._update_funcs.append(u_prompt_lang)
+        _, self._vars["text_lang"], u_text_lang = create_standard_row(frame, "Target Lang:", "text_lang")
+        self._update_funcs.append(u_text_lang)
+        _, self._vars["opacity"], u_opacity = create_standard_row(frame, "Window Opacity:", "opacity")
+        self._update_funcs.append(u_opacity)
+        _, self._vars["speed_factor"], u_speed = create_standard_row(frame, "Speed:", "speed_factor")
+        self._update_funcs.append(u_speed)
+        _, self._vars["text_split_method"], u_split = create_standard_row(frame, "Split Method:", "text_split_method")
+        self._update_funcs.append(u_split)
 
-        self._vars["prompt_text"] = create_standard_row(frame, "Prompt Text:", "prompt_text")
-        self._vars["prompt_lang"] = create_standard_row(frame, "Prompt Lang:", "prompt_lang")
-        self._vars["text_lang"] = create_standard_row(frame, "Target Lang:", "text_lang")
-        self._vars["opacity"] = create_standard_row(frame, "Window Opacity:", "opacity")
-        self._vars["speed_factor"] = create_standard_row(frame, "Speed:", "speed_factor")
-        self._vars["text_split_method"] = create_standard_row(frame, "Split Method:", "text_split_method")
+        _, self._vars["ssh_host"], u_ssh_host = create_ssh_row(frame, "SSH Host:", "ssh_host")
+        self._update_funcs.append(u_ssh_host)
+        _, self._vars["ssh_port"], u_ssh_port = create_ssh_row(frame, "SSH Port:", "ssh_port")
+        self._update_funcs.append(u_ssh_port)
+        _, self._vars["ssh_user"], u_ssh_user = create_ssh_row(frame, "SSH User:", "ssh_user")
+        self._update_funcs.append(u_ssh_user)
+        _, self._vars["ssh_key_path"], u_ssh_key = create_ssh_row(frame, "SSH Key:", "ssh_key_path", is_file=True)
+        self._update_funcs.append(u_ssh_key)
+        _, self._vars["ssh_local_port"], u_local_port = create_ssh_row(frame, "Local Port:", "ssh_local_port")
+        self._update_funcs.append(u_local_port)
+        _, self._vars["ssh_remote_host"], u_remote_host = create_ssh_row(frame, "Remote Host:", "ssh_remote_host")
+        self._update_funcs.append(u_remote_host)
+        _, self._vars["ssh_remote_port"], u_remote_port = create_ssh_row(frame, "Remote Port:", "ssh_remote_port")
+        self._update_funcs.append(u_remote_port)
+        _, self._vars["ssh_extra_args"], u_extra_args = create_ssh_row(frame, "SSH Extra Args:", "ssh_extra_args")
+        self._update_funcs.append(u_extra_args)
 
         def update_ui_state():
             for f in self._update_funcs: f()
         
         update_ui_state()
 
-        info_lbl = tk.Label(frame, text="Lang Codes: zh (Chinese), en (English), ja (Japanese), auto\nCloud Mode: Enter remote paths manually.", bg=self.bg_color, fg="#aaaaaa", font=("Segoe UI", 8), justify=tk.LEFT)
+        info_lbl = tk.Label(frame, text="Lang Codes: zh (Chinese), en (English), ja (Japanese), auto\nCloud Mode: remote model and audio paths must be paths on the cloud machine.\nUse SSH Tunnel = local text box -> localhost forwarded port -> remote GPT-SoVITS API.", bg=self.bg_color, fg="#aaaaaa", font=("Segoe UI", 8), justify=tk.LEFT)
         info_lbl.pack(pady=5)
 
         btn_font = ("Segoe UI", 10)
@@ -384,27 +581,46 @@ class FloatingTTSApp:
         tk.Button(btn_frame, text="Cancel", command=dlg.destroy, bg="#555555", fg="white", font=btn_font, relief="flat").pack(side=tk.RIGHT, padx=10, ipadx=10)
 
     def save_settings(self, dlg):
+        new_config = dict(self.config)
         for k, v in self._vars.items():
-            val = v.get().strip()
-            if k in ["opacity", "speed_factor"]:
-                try: val = float(val)
-                except: pass
-            
-            # If models changed, inform the API
-            if k == "gpt_model" and val != self.config.get("gpt_model"):
-                threading.Thread(target=self.set_model, args=("set_gpt_weights", "weights_path", val), daemon=True).start()
-            if k == "sovits_model" and val != self.config.get("sovits_model"):
-                threading.Thread(target=self.set_model, args=("set_sovits_weights", "weights_path", val), daemon=True).start()
+            raw_val = v.get()
+            val = raw_val.strip() if isinstance(raw_val, str) else raw_val
+            if k == "use_ssh_tunnel":
+                val = bool(raw_val)
+            elif k in ["opacity", "speed_factor"]:
+                try:
+                    val = float(val)
+                except Exception:
+                    pass
+            elif k in ["ssh_port", "ssh_local_port", "ssh_remote_port", "batch_size"]:
+                try:
+                    val = int(val)
+                except Exception:
+                    pass
 
-            self.config[k] = val
+            new_config[k] = val
+
+        gpt_changed = new_config.get("gpt_model") != self.config.get("gpt_model")
+        sovits_changed = new_config.get("sovits_model") != self.config.get("sovits_model")
+        self.config = new_config
+
+        if self.config.get("run_mode") != "Cloud" or not self.config.get("use_ssh_tunnel", True):
+            self.stop_ssh_tunnel()
+
         self.save_config()
         self.root.attributes("-alpha", self.config.get("opacity", 0.85))
+
+        if gpt_changed:
+            threading.Thread(target=self.set_model, args=("set_gpt_weights", "weights_path", self.config.get("gpt_model", "")), daemon=True).start()
+        if sovits_changed:
+            threading.Thread(target=self.set_model, args=("set_sovits_weights", "weights_path", self.config.get("sovits_model", "")), daemon=True).start()
+
         dlg.destroy()
 
     def set_model(self, endpoint, param_name, model_path):
         if not model_path:
             return
-        api_url = self.config.get("api_url", "http://127.0.0.1:9880/tts")
+        api_url = self.get_effective_api_url()
         base_url = api_url.rsplit('/', 1)[0]
         try:
             url = f"{base_url}/{endpoint}?{param_name}={urllib.parse.quote(model_path)}"
@@ -417,4 +633,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = FloatingTTSApp(root)
     root.mainloop()
-
